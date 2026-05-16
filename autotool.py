@@ -58,6 +58,8 @@ process_pid_cache = None
 process_last_lookup = 0.0
 PROCESS_VM_READ = 0x0010
 PROCESS_QUERY_INFORMATION = 0x0400
+CLICK_JITTER_PX = 1.0
+TARGET_LOCK_TIMEOUT_SECONDS = 1.2
 
 # Tunable parameters
 MATCH_THRESHOLD = 10  # Minimum number of feature matches (higher = stricter)
@@ -108,6 +110,7 @@ def load_templates():
 
 
 def get_metin2_pid():
+    """Return PID for metin2client.bin, caching the last successful lookup for 2 seconds."""
     global process_pid_cache, process_last_lookup
     if not sys.platform.startswith("win"):
         return 0
@@ -174,6 +177,7 @@ def load_process_offsets():
             "x": _parse_address(raw.get("target_x_address")),
             "y": _parse_address(raw.get("target_y_address")),
             "valid": _parse_address(raw.get("target_valid_address")),
+            "valid_min": int(raw.get("target_valid_min", 1)),
             "x_type": str(raw.get("target_x_type", "float")).lower(),
             "y_type": str(raw.get("target_y_type", "float")).lower(),
         }
@@ -194,6 +198,7 @@ def load_process_offsets():
 
 
 def _read_process_value(process_handle, address, value_type):
+    """Read a 4-byte value from process memory as int/uint/float, or return None on failure."""
     size = 4
     buffer = ctypes.create_string_buffer(size)
     bytes_read = ctypes.c_size_t(0)
@@ -216,6 +221,7 @@ def _read_process_value(process_handle, address, value_type):
 
 
 def read_process_target_position():
+    """Read target screen position from metin2client memory and return (x, y) or None."""
     offsets = load_process_offsets()
     if not offsets:
         return None
@@ -235,7 +241,7 @@ def read_process_target_position():
     try:
         if offsets.get("valid") is not None:
             valid = _read_process_value(process_handle, offsets["valid"], "int")
-            if valid is None or valid == 0:
+            if valid is None or valid < offsets.get("valid_min", 1):
                 return None
 
         x = _read_process_value(process_handle, offsets["x"], offsets.get("x_type", "float"))
@@ -695,14 +701,14 @@ def locate_and_click_loop():
                         print("All matches are blacklisted, searching for new target...")
 
             if selected_target is not None:
-                click_jitter = 1.0
+                click_jitter = CLICK_JITTER_PX
                 rx = selected_target["x"] + random.uniform(-click_jitter, click_jitter)
                 ry = selected_target["y"] + random.uniform(-click_jitter, click_jitter)
 
                 print(f"Moving to target ({rx:.1f}, {ry:.1f}) [{selected_target['source']}]...")
                 pyautogui.moveTo(rx, ry)
 
-                if not _confirm_target_lock(rx, ry, timeout=1.2):
+                if not _confirm_target_lock(rx, ry, timeout=TARGET_LOCK_TIMEOUT_SECONDS):
                     print("✗ Target lock check failed, skipping click")
                     time.sleep(random.uniform(0.4, 1.2))
                     continue
@@ -791,7 +797,7 @@ def main():
     print(f"\nSettings:")
     print(f"  Feature match threshold: {MATCH_THRESHOLD}")
     print(f"  Color tolerance: {COLOR_TOLERANCE}")
-    print(f"  Click offset: Very small (±1.0px)")
+    print(f"  Click offset: Very small (±{CLICK_JITTER_PX:.1f}px)")
     print(f"  Auto-rotate: 5 sec after 10 sec idle")
     print()
     

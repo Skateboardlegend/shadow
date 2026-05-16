@@ -54,8 +54,10 @@ enemy_name_update_interval = 2.0  # Update every 2 seconds
 in_combat = False  # Track if we've clicked on an enemy
 process_offsets_cache = None
 process_offsets_mtime = None
-process_pid_cache = 0
+process_pid_cache = None
 process_last_lookup = 0.0
+PROCESS_VM_READ = 0x0010
+PROCESS_QUERY_INFORMATION = 0x0400
 
 # Tunable parameters
 MATCH_THRESHOLD = 10  # Minimum number of feature matches (higher = stricter)
@@ -107,8 +109,11 @@ def load_templates():
 
 def get_metin2_pid():
     global process_pid_cache, process_last_lookup
+    if not sys.platform.startswith("win"):
+        return 0
+
     now = time.time()
-    if process_pid_cache and (now - process_last_lookup) < 2.0:
+    if process_pid_cache is not None and process_pid_cache > 0 and (now - process_last_lookup) < 2.0:
         return process_pid_cache
 
     process_last_lookup = now
@@ -126,8 +131,11 @@ def get_metin2_pid():
             image_name = row[0].strip().lower()
             if image_name == PROCESS_NAME.lower():
                 pid_value = row[1].strip().replace(",", "")
-                process_pid_cache = int(pid_value)
-                return process_pid_cache
+                try:
+                    process_pid_cache = int(pid_value)
+                    return process_pid_cache
+                except ValueError:
+                    continue
     except Exception:
         return 0
 
@@ -216,8 +224,6 @@ def read_process_target_position():
     if not pid:
         return None
 
-    PROCESS_VM_READ = 0x0010
-    PROCESS_QUERY_INFORMATION = 0x0400
     process_handle = ctypes.windll.kernel32.OpenProcess(
         PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
         False,
@@ -238,7 +244,7 @@ def read_process_target_position():
             return None
 
         screen_w, screen_h = pyautogui.size()
-        if not (0 <= x <= screen_w and 0 <= y <= screen_h):
+        if not (0 <= x < screen_w and 0 <= y < screen_h):
             return None
 
         return float(x), float(y)
@@ -251,8 +257,12 @@ def read_process_target_position():
 def _is_blacklisted(x, y):
     if not last_clicked_position:
         return False
-    dist = ((x - last_clicked_position[0]) ** 2 + (y - last_clicked_position[1]) ** 2) ** 0.5
+    dist = _distance(x, y, last_clicked_position[0], last_clicked_position[1])
     return dist <= blacklist_radius
+
+
+def _distance(x1, y1, x2, y2):
+    return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
 
 
 def _confirm_target_lock(x, y, timeout=1.0):
@@ -267,7 +277,7 @@ def _confirm_target_lock(x, y, timeout=1.0):
         process_pos = read_process_target_position()
         if process_pos is not None:
             px, py = process_pos
-            if ((px - x) ** 2 + (py - y) ** 2) ** 0.5 <= 35:
+            if _distance(px, py, x, y) <= 35:
                 return True
 
         time.sleep(0.08)
@@ -503,7 +513,7 @@ def find_matches_orb(screenshot_cv, template_cv, scales=None):
         for match in sorted(matches_list, key=lambda m: m['confidence'], reverse=True):
             is_duplicate = False
             for existing in unique_matches:
-                dist = ((match['x'] - existing['x'])**2 + (match['y'] - existing['y'])**2)**0.5
+                dist = _distance(match['x'], match['y'], existing['x'], existing['y'])
                 if dist < 40:
                     is_duplicate = True
                     break
@@ -664,7 +674,7 @@ def locate_and_click_loop():
 
                             for j, other in enumerate(filtered_matches):
                                 if j > i and j not in used:
-                                    dist = ((match['x'] - other['x'])**2 + (match['y'] - other['y'])**2)**0.5
+                                    dist = _distance(match['x'], match['y'], other['x'], other['y'])
                                     if dist < 50:
                                         cluster.append(other)
                                         used.add(j)
@@ -685,9 +695,9 @@ def locate_and_click_loop():
                         print("All matches are blacklisted, searching for new target...")
 
             if selected_target is not None:
-                max_offset = 1
-                rx = selected_target["x"] + random.uniform(-max_offset, max_offset)
-                ry = selected_target["y"] + random.uniform(-max_offset, max_offset)
+                click_jitter = 1.0
+                rx = selected_target["x"] + random.uniform(-click_jitter, click_jitter)
+                ry = selected_target["y"] + random.uniform(-click_jitter, click_jitter)
 
                 print(f"Moving to target ({rx:.1f}, {ry:.1f}) [{selected_target['source']}]...")
                 pyautogui.moveTo(rx, ry)
@@ -774,12 +784,14 @@ def main():
     print("Press F2 to capture target (75x75 around cursor)")
     print("Press F3 to start searching and clicking")
     print("Press ESC to stop")
+    if not sys.platform.startswith("win"):
+        print("Warning: process-assisted metin2client.bin reading is Windows-only.")
     print(f"Templates folder: {SCREENSHOTS_DIR}")
     print(f"Optional process offsets file: {PROCESS_OFFSETS_PATH}")
     print(f"\nSettings:")
     print(f"  Feature match threshold: {MATCH_THRESHOLD}")
     print(f"  Color tolerance: {COLOR_TOLERANCE}")
-    print(f"  Click offset: Very small (±1px)")
+    print(f"  Click offset: Very small (±1.0px)")
     print(f"  Auto-rotate: 5 sec after 10 sec idle")
     print()
     

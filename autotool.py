@@ -4,9 +4,13 @@ import os
 import time
 import threading
 import random
+import struct
+import subprocess
+import csv
+import json
 import cv2
 import numpy as np
-from PIL import ImageGrab, Image
+from PIL import ImageGrab
 
 import pyautogui
 import keyboard
@@ -30,6 +34,9 @@ if not is_admin() and '--elevated' not in sys.argv:
 print("Hello meow - Feature-based detection mode")
 
 TARGET_NAME = os.path.join(os.getcwd(), "current_target.png")
+SCREENSHOTS_DIR = os.path.join(os.getcwd(), "screenshots")
+PROCESS_NAME = "metin2client.bin"
+PROCESS_OFFSETS_PATH = os.path.join(os.getcwd(), "metin2_offsets.json")
 stop_event = threading.Event()
 search_thread = None
 lock = threading.Lock()
@@ -45,6 +52,10 @@ last_enemy_name = ""
 last_enemy_check_time = 0
 enemy_name_update_interval = 2.0  # Update every 2 seconds
 in_combat = False  # Track if we've clicked on an enemy
+process_offsets_cache = None
+process_offsets_mtime = None
+process_pid_cache = 0
+process_last_lookup = 0.0
 
 # Tunable parameters
 MATCH_THRESHOLD = 10  # Minimum number of feature matches (higher = stricter)
@@ -53,6 +64,215 @@ USE_COLOR_DETECTION = True  # Also use dominant color for extra filtering
 COLOR_TOLERANCE = 50  # How much color variation to allow (0-255)
 
 pyautogui.FAILSAFE = True
+
+
+def _is_image_file(filename: str) -> bool:
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+
+def load_templates():
+    templates = []
+
+    if os.path.isdir(SCREENSHOTS_DIR):
+        for filename in sorted(os.listdir(SCREENSHOTS_DIR)):
+            if not _is_image_file(filename):
+                continue
+            full_path = os.path.join(SCREENSHOTS_DIR, filename)
+            template_cv = cv2.imread(full_path)
+            if template_cv is None:
+                print(f"Skipping unreadable template: {full_path}")
+                continue
+            h, w = template_cv.shape[:2]
+            templates.append({
+                "name": filename,
+                "path": full_path,
+                "cv": template_cv,
+                "size": (w, h)
+            })
+
+    if os.path.exists(TARGET_NAME):
+        template_cv = cv2.imread(TARGET_NAME)
+        if template_cv is not None:
+            h, w = template_cv.shape[:2]
+            templates.append({
+                "name": os.path.basename(TARGET_NAME),
+                "path": TARGET_NAME,
+                "cv": template_cv,
+                "size": (w, h)
+            })
+
+    return templates
+
+
+def get_metin2_pid():
+    global process_pid_cache, process_last_lookup
+    now = time.time()
+    if process_pid_cache and (now - process_last_lookup) < 2.0:
+        return process_pid_cache
+
+    process_last_lookup = now
+    process_pid_cache = 0
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        reader = csv.reader(output.splitlines())
+        for row in reader:
+            if len(row) < 2:
+                continue
+            image_name = row[0].strip().lower()
+            if image_name == PROCESS_NAME.lower():
+                pid_value = row[1].strip().replace(",", "")
+                process_pid_cache = int(pid_value)
+                return process_pid_cache
+    except Exception:
+        return 0
+
+    return 0
+
+
+def _parse_address(value):
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        if value.lower().startswith("0x"):
+            return int(value, 16)
+        return int(value)
+    return None
+
+
+def load_process_offsets():
+    global process_offsets_cache, process_offsets_mtime
+    try:
+        if not os.path.exists(PROCESS_OFFSETS_PATH):
+            process_offsets_cache = None
+            process_offsets_mtime = None
+            return None
+
+        mtime = os.path.getmtime(PROCESS_OFFSETS_PATH)
+        if process_offsets_cache is not None and process_offsets_mtime == mtime:
+            return process_offsets_cache
+
+        with open(PROCESS_OFFSETS_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        parsed = {
+            "x": _parse_address(raw.get("target_x_address")),
+            "y": _parse_address(raw.get("target_y_address")),
+            "valid": _parse_address(raw.get("target_valid_address")),
+            "x_type": str(raw.get("target_x_type", "float")).lower(),
+            "y_type": str(raw.get("target_y_type", "float")).lower(),
+        }
+        if parsed["x"] is None or parsed["y"] is None:
+            process_offsets_cache = None
+            process_offsets_mtime = mtime
+            return None
+
+        process_offsets_cache = parsed
+        process_offsets_mtime = mtime
+        print(f"Loaded process offsets from {PROCESS_OFFSETS_PATH}")
+        return process_offsets_cache
+    except Exception as e:
+        print(f"Failed to load process offsets: {e}")
+        process_offsets_cache = None
+        process_offsets_mtime = None
+        return None
+
+
+def _read_process_value(process_handle, address, value_type):
+    size = 4
+    buffer = ctypes.create_string_buffer(size)
+    bytes_read = ctypes.c_size_t(0)
+    ok = ctypes.windll.kernel32.ReadProcessMemory(
+        process_handle,
+        ctypes.c_void_p(address),
+        buffer,
+        size,
+        ctypes.byref(bytes_read)
+    )
+    if not ok or bytes_read.value != size:
+        return None
+
+    raw = buffer.raw
+    if value_type == "int":
+        return struct.unpack("<i", raw)[0]
+    if value_type == "uint":
+        return struct.unpack("<I", raw)[0]
+    return struct.unpack("<f", raw)[0]
+
+
+def read_process_target_position():
+    offsets = load_process_offsets()
+    if not offsets:
+        return None
+
+    pid = get_metin2_pid()
+    if not pid:
+        return None
+
+    PROCESS_VM_READ = 0x0010
+    PROCESS_QUERY_INFORMATION = 0x0400
+    process_handle = ctypes.windll.kernel32.OpenProcess(
+        PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+        False,
+        pid
+    )
+    if not process_handle:
+        return None
+
+    try:
+        if offsets.get("valid") is not None:
+            valid = _read_process_value(process_handle, offsets["valid"], "int")
+            if valid is None or valid == 0:
+                return None
+
+        x = _read_process_value(process_handle, offsets["x"], offsets.get("x_type", "float"))
+        y = _read_process_value(process_handle, offsets["y"], offsets.get("y_type", "float"))
+        if x is None or y is None:
+            return None
+
+        screen_w, screen_h = pyautogui.size()
+        if not (0 <= x <= screen_w and 0 <= y <= screen_h):
+            return None
+
+        return float(x), float(y)
+    except Exception:
+        return None
+    finally:
+        ctypes.windll.kernel32.CloseHandle(process_handle)
+
+
+def _is_blacklisted(x, y):
+    if not last_clicked_position:
+        return False
+    dist = ((x - last_clicked_position[0]) ** 2 + (y - last_clicked_position[1]) ** 2) ** 0.5
+    return dist <= blacklist_radius
+
+
+def _confirm_target_lock(x, y, timeout=1.0):
+    start_time = time.time()
+    while time.time() - start_time < timeout and not stop_event.is_set():
+        screenshot_check = ImageGrab.grab()
+        screenshot_check_cv = cv2.cvtColor(np.array(screenshot_check), cv2.COLOR_RGB2BGR)
+
+        if detect_red_circle(screenshot_check_cv, x, y, radius=70):
+            return True
+
+        process_pos = read_process_target_position()
+        if process_pos is not None:
+            px, py = process_pos
+            if ((px - x) ** 2 + (py - y) ** 2) ** 0.5 <= 35:
+                return True
+
+        time.sleep(0.08)
+
+    return False
 
 
 def get_dominant_color(img):
@@ -368,180 +588,141 @@ def find_matches_color(screenshot_cv, template_cv, tolerance=40):
 
 def locate_and_click_loop():
     global last_clicked_position, last_enemy_name, last_enemy_check_time, in_combat
-    print("F3 loop started: searching for target using feature detection (press ESC to stop)")
-    if not os.path.exists(TARGET_NAME):
-        print("No target image found. Press F2 to create current_target.png first.")
+    print("F3 loop started: searching for target using process + template detection (press ESC to stop)")
+    templates = load_templates()
+    if not templates:
+        print("No templates found. Add images in screenshots/ or capture current_target.png with F2.")
         return
-    
-    template_cv = cv2.imread(TARGET_NAME)
-    template_pil = Image.open(TARGET_NAME)
-    template_size = template_pil.size
-    
-    if template_cv is None:
-        print(f"Failed to load template image: {TARGET_NAME}")
-        return
-    
-    print(f"Template size: {template_size}")
-    print(f"Mode: Multi-scale Pattern Matching + Color Detection")
+
+    print(f"Loaded {len(templates)} templates (screenshots/ + current_target.png if present)")
+    print("Mode: Process-assisted targeting + multi-template matching")
     print(f"Enemy health bar monitoring: Enabled (Area: {HEALTH_BAR_X1},{HEALTH_BAR_Y1} to {HEALTH_BAR_X2},{HEALTH_BAR_Y2})")
-    
+
     last_match_time = time.time()
     in_combat = False
-    
+
     while not stop_event.is_set():
         try:
-            # Capture screenshot
             screenshot = ImageGrab.grab()
             screenshot_cv = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
-            
-            # Check for enemy health bar (only matters if we're in combat)
+
             has_enemy_health_bar, enemy_name = detect_enemy_health_bar(screenshot_cv)
-            
-            # Update enemy name every 2 seconds (only if in combat)
             current_time = time.time()
             if in_combat and has_enemy_health_bar and (current_time - last_enemy_check_time) >= enemy_name_update_interval:
                 last_enemy_name = enemy_name
                 last_enemy_check_time = current_time
                 print(f"[ENEMY ENGAGED] {enemy_name if enemy_name else 'Unknown'}")
-            
-            # If we're in combat and enemy health bar is present, don't click - just continue searching
+
             if in_combat and has_enemy_health_bar:
                 print(f"⚠ In combat with enemy - skipping click action")
                 time.sleep(random.uniform(1, 2))
                 continue
-            
-            # If health bar disappeared, exit combat
+
             if in_combat and not has_enemy_health_bar:
                 print(f"✓ Enemy defeated - exiting combat")
                 in_combat = False
-            
-            # Find matches using feature detection
-            feature_matches = find_matches_orb(screenshot_cv, template_cv, scales=SCALES)
-            
-            # Find matches using color detection
-            color_matches = find_matches_color(screenshot_cv, template_cv, tolerance=COLOR_TOLERANCE) if USE_COLOR_DETECTION else []
-            
-            # Combine matches
-            all_matches = feature_matches + color_matches
-            
-            if all_matches:
-                # Filter out matches near the last clicked position (blacklist)
-                filtered_matches = all_matches
-                if last_clicked_position:
-                    filtered_matches = []
-                    for match in all_matches:
-                        dist = ((match['x'] - last_clicked_position[0])**2 + (match['y'] - last_clicked_position[1])**2)**0.5
-                        if dist > blacklist_radius:
-                            filtered_matches.append(match)
-                    
+
+            selected_target = None
+            process_position = read_process_target_position()
+            if process_position is not None:
+                px, py = process_position
+                if not _is_blacklisted(px, py):
+                    selected_target = {
+                        "x": px,
+                        "y": py,
+                        "source": "process",
+                        "cluster_size": 1
+                    }
+                    print(f"Using process target at ({px:.1f}, {py:.1f})")
+
+            if selected_target is None:
+                all_matches = []
+                for template in templates:
+                    feature_matches = find_matches_orb(screenshot_cv, template["cv"], scales=SCALES)
+                    color_matches = find_matches_color(screenshot_cv, template["cv"], tolerance=COLOR_TOLERANCE) if USE_COLOR_DETECTION else []
+                    for m in feature_matches:
+                        m["source"] = f"feature:{template['name']}"
+                    for m in color_matches:
+                        m["source"] = f"color:{template['name']}"
+                    all_matches.extend(feature_matches + color_matches)
+
+                if all_matches:
+                    filtered_matches = [m for m in all_matches if not _is_blacklisted(m["x"], m["y"])]
                     if len(filtered_matches) < len(all_matches):
                         print(f"Filtered out {len(all_matches) - len(filtered_matches)} blacklisted matches near last click")
-                
-                if not filtered_matches:
-                    print("All matches are blacklisted, searching for new target...")
-                    time.sleep(random.uniform(1, 3))
-                    continue
-                
-                all_matches = filtered_matches
-                # Update last match time
-                last_match_time = time.time()
-                
-                # Cluster nearby matches and get centroids
-                clusters = []
-                used = set()
-                
-                for i, match in enumerate(all_matches):
-                    if i in used:
-                        continue
-                    
-                    cluster = [match]
-                    used.add(i)
-                    
-                    # Find nearby matches
-                    for j, other in enumerate(all_matches):
-                        if j > i and j not in used:
-                            dist = ((match['x'] - other['x'])**2 + (match['y'] - other['y'])**2)**0.5
-                            if dist < 50:  # Cluster radius
-                                cluster.append(other)
-                                used.add(j)
-                    
-                    clusters.append(cluster)
-                
-                # Use best cluster (most matches)
-                best_cluster = max(clusters, key=len)
-                
-                # Calculate centroid of best cluster
-                cx = int(np.mean([m['x'] for m in best_cluster]))
-                cy = int(np.mean([m['y'] for m in best_cluster]))
-                
-                # Add very small random offset for natural clicking
-                max_offset = 2
-                rx = cx + random.uniform(-max_offset, max_offset)
-                ry = cy + random.uniform(-max_offset, max_offset)
-                
-                # Move mouse to target location first
-                print(f"Moving to target ({rx:.1f}, {ry:.1f})...")
+
+                    if filtered_matches:
+                        last_match_time = time.time()
+                        clusters = []
+                        used = set()
+
+                        for i, match in enumerate(filtered_matches):
+                            if i in used:
+                                continue
+                            cluster = [match]
+                            used.add(i)
+
+                            for j, other in enumerate(filtered_matches):
+                                if j > i and j not in used:
+                                    dist = ((match['x'] - other['x'])**2 + (match['y'] - other['y'])**2)**0.5
+                                    if dist < 50:
+                                        cluster.append(other)
+                                        used.add(j)
+
+                            clusters.append(cluster)
+
+                        best_cluster = max(clusters, key=lambda c: (len(c), sum(v.get("confidence", 0.0) for v in c)))
+                        cx = int(np.mean([m['x'] for m in best_cluster]))
+                        cy = int(np.mean([m['y'] for m in best_cluster]))
+
+                        selected_target = {
+                            "x": float(cx),
+                            "y": float(cy),
+                            "source": "vision",
+                            "cluster_size": len(best_cluster)
+                        }
+                    else:
+                        print("All matches are blacklisted, searching for new target...")
+
+            if selected_target is not None:
+                max_offset = 1
+                rx = selected_target["x"] + random.uniform(-max_offset, max_offset)
+                ry = selected_target["y"] + random.uniform(-max_offset, max_offset)
+
+                print(f"Moving to target ({rx:.1f}, {ry:.1f}) [{selected_target['source']}]...")
                 pyautogui.moveTo(rx, ry)
-                
-                # Wait for red circle to appear (with increased radius)
-                red_circle_found = False
-                max_wait = 1.5  # Wait up to 1.5 seconds for red circle
-                start_time = time.time()
-                
-                while time.time() - start_time < max_wait and not stop_event.is_set():
-                    screenshot_check = ImageGrab.grab()
-                    screenshot_check_cv = cv2.cvtColor(np.array(screenshot_check), cv2.COLOR_RGB2BGR)
-                    
-                    # Check if enemy health bar appeared while hovering
-                    enemy_appeared, _ = detect_enemy_health_bar(screenshot_check_cv)
-                    if enemy_appeared:
-                        print(f"✗ Enemy health bar appeared while hovering - aborting click")
-                        red_circle_found = False
-                        break
-                    
-                    # Use larger radius (70 instead of 40) to detect red circle
-                    if detect_red_circle(screenshot_check_cv, rx, ry, radius=70):
-                        red_circle_found = True
-                        print(f"✓ Red circle appeared after hover")
-                        break
-                    
-                    time.sleep(0.1)  # Check every 100ms
-                
-                if not red_circle_found:
-                    print(f"✗ Red circle did not appear after hovering, skipping click")
-                    time.sleep(random.uniform(1, 3))
+
+                if not _confirm_target_lock(rx, ry, timeout=1.2):
+                    print("✗ Target lock check failed, skipping click")
+                    time.sleep(random.uniform(0.4, 1.2))
                     continue
-                
-                # Red circle confirmed, now click
-                print(f"Clicking on target...")
+
+                print("Clicking on confirmed target...")
                 pyautogui.click()
-                print(f"Clicked at ({rx:.1f}, {ry:.1f}) - {len(best_cluster)} matches in cluster")
-                
-                # Store click position for blacklisting and mark that we're in combat
+                print(
+                    f"Clicked at ({rx:.1f}, {ry:.1f}) "
+                    f"[source={selected_target['source']}, cluster={selected_target['cluster_size']}]"
+                )
+
                 last_clicked_position = (rx, ry)
                 in_combat = True
+                last_match_time = time.time()
                 print(f"Blacklisting area around ({rx:.1f}, {ry:.1f}) with radius {blacklist_radius}px")
-                
-                # Wait 5 seconds after clicking
-                print("Waiting 5 seconds before next action...")
                 time.sleep(5)
             else:
-                # Check if 10 seconds have passed without finding a target
                 time_since_match = time.time() - last_match_time
                 if time_since_match > 10:
                     print(f"No targets found for 10 seconds, rotating camera...")
-                    # Rotate camera for 5 seconds
                     start_time = time.time()
                     while time.time() - start_time < 5 and not stop_event.is_set():
                         current_x, current_y = pyautogui.position()
                         pyautogui.moveTo(current_x + 30, current_y)
                         time.sleep(0.05)
                     print("Camera rotation finished, resuming search...")
-                    last_match_time = time.time()  # Reset timer after rotation
+                    last_match_time = time.time()
                 else:
                     print(f"No targets found ({time_since_match:.1f}s idle)")
-            
-            # wait 1-3 seconds before searching again
+
             time.sleep(random.uniform(0, 0.5))
         except Exception as e:
             print(f"Error during search/click: {type(e).__name__}: {e}")
@@ -589,14 +770,16 @@ def on_esc(event=None):
 
 
 def main():
-    print("=== Feature-Based Target Detection ===")
+    print("=== Process + Template Target Detection ===")
     print("Press F2 to capture target (75x75 around cursor)")
     print("Press F3 to start searching and clicking")
     print("Press ESC to stop")
+    print(f"Templates folder: {SCREENSHOTS_DIR}")
+    print(f"Optional process offsets file: {PROCESS_OFFSETS_PATH}")
     print(f"\nSettings:")
     print(f"  Feature match threshold: {MATCH_THRESHOLD}")
     print(f"  Color tolerance: {COLOR_TOLERANCE}")
-    print(f"  Click offset: Very small (±2px)")
+    print(f"  Click offset: Very small (±1px)")
     print(f"  Auto-rotate: 5 sec after 10 sec idle")
     print()
     
